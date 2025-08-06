@@ -1,22 +1,12 @@
-# Python GUI Folder Scanner Requirements
-# This application uses built-in Python libraries primarily
-# The following packages may be needed for enhanced functionality
-
-# Core GUI framework (tkinter is built-in with Python)
-# No additional packages required for basic functionality
-
-# Optional: For enhanced styling and modern widgets
-# Uncomment the following if you want additional GUI enhancements:
-# customtkinter>=5.0.0
-# pillow>=9.0.0
-
-# For cross-platform compatibility
+psutil>=5.8.0
 pathlib2>=2.3.0; python_version<"3.4"
-
-# Note: This application primarily uses Python's built-in libraries:
-# - tkinter (GUI framework)
-# - os (file system operations)
-# - threading (background processing)
-# - subprocess (opening folders)
-# - pathlib (path handling)
-# - string (drive enumeration)
+customtkinter>=5.0.0
+pillow>=9.0.0
+tkinter 
+os 
+threading 
+subprocess 
+pathlib 
+concurrent.futures 
+queue 
+psutil 

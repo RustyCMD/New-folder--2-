@@ -6,6 +6,9 @@ import subprocess
 import sys
 from pathlib import Path
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import psutil
 
 class FolderScanner:
     def __init__(self, root):
@@ -20,6 +23,8 @@ class FolderScanner:
         # Variables
         self.scanning = False
         self.folder_data = []
+        self.scan_queue = queue.Queue()
+        self.max_workers = min(8, os.cpu_count() or 4)  # Limit concurrent threads
         
         # Create GUI
         self.create_widgets()
@@ -137,29 +142,96 @@ class FolderScanner:
         
         return f"{size_bytes:.2f} {size_names[i]}"
     
-    def get_folder_size(self, folder_path):
-        """Calculate total size of a folder"""
+    def get_folder_size_fast(self, folder_path, max_depth=3, timeout=30):
+        """Fast folder size calculation with optimizations"""
         total_size = 0
+        start_time = time.time()
+
         try:
-            for dirpath, dirnames, filenames in os.walk(folder_path):
-                for filename in filenames:
+            # Use os.scandir for faster directory listing
+            with os.scandir(folder_path) as entries:
+                for entry in entries:
+                    # Check timeout to avoid hanging on large folders
+                    if time.time() - start_time > timeout:
+                        break
+
                     try:
-                        file_path = os.path.join(dirpath, filename)
-                        if os.path.exists(file_path):
-                            total_size += os.path.getsize(file_path)
-                    except (OSError, IOError):
+                        if entry.is_file(follow_symlinks=False):
+                            total_size += entry.stat().st_size
+                        elif entry.is_dir(follow_symlinks=False) and max_depth > 0:
+                            # Recursively scan subdirectories with depth limit
+                            total_size += self.get_folder_size_fast(
+                                entry.path, max_depth - 1, timeout - (time.time() - start_time)
+                            )
+                    except (OSError, IOError, PermissionError):
                         continue
-        except (OSError, IOError):
+        except (OSError, IOError, PermissionError):
             pass
+
         return total_size
-    
-    def scan_folders(self):
-        """Scan all drives for largest folders"""
+
+    def get_folder_size_estimate(self, folder_path):
+        """Quick folder size estimate using sampling"""
         try:
-            self.folder_data = []
-            drives = []
-            
-            # Get all available drives on Windows
+            # For very large folders, estimate size by sampling
+            total_size = 0
+            file_count = 0
+            sample_size = 0
+            max_samples = 1000  # Limit samples for speed
+
+            with os.scandir(folder_path) as entries:
+                for entry in entries:
+                    if file_count >= max_samples:
+                        break
+
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            size = entry.stat().st_size
+                            total_size += size
+                            sample_size += size
+                            file_count += 1
+                        elif entry.is_dir(follow_symlinks=False):
+                            # Quick check of subdirectory
+                            try:
+                                with os.scandir(entry.path) as sub_entries:
+                                    for sub_entry in sub_entries:
+                                        if file_count >= max_samples:
+                                            break
+                                        if sub_entry.is_file(follow_symlinks=False):
+                                            size = sub_entry.stat().st_size
+                                            total_size += size
+                                            file_count += 1
+                            except (OSError, IOError, PermissionError):
+                                continue
+                    except (OSError, IOError, PermissionError):
+                        continue
+
+            return total_size
+        except (OSError, IOError, PermissionError):
+            return 0
+    
+    def scan_single_folder(self, folder_path):
+        """Scan a single folder and return its size"""
+        try:
+            # Use fast estimation for very large folders
+            size = self.get_folder_size_estimate(folder_path)
+            return folder_path, size
+        except Exception:
+            return folder_path, 0
+
+    def get_drives_fast(self):
+        """Get available drives using psutil for better performance"""
+        drives = []
+        try:
+            # Use psutil for faster drive detection
+            partitions = psutil.disk_partitions()
+            for partition in partitions:
+                if os.name == 'nt' and partition.fstype:  # Windows with valid filesystem
+                    drives.append(partition.mountpoint)
+                elif os.name != 'nt':  # Unix-like systems
+                    drives.append(partition.mountpoint)
+        except:
+            # Fallback to old method
             if os.name == 'nt':
                 import string
                 for letter in string.ascii_uppercase:
@@ -168,33 +240,74 @@ class FolderScanner:
                         drives.append(drive)
             else:
                 drives = ['/']
-            
-            self.update_status(f"Scanning {len(drives)} drives...")
-            
+
+        return drives
+
+    def get_top_level_folders(self, drives):
+        """Get all top-level folders from all drives"""
+        folders = []
+        for drive in drives:
+            try:
+                with os.scandir(drive) as entries:
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False):
+                            folders.append(entry.path)
+            except (OSError, IOError, PermissionError):
+                continue
+        return folders
+
+    def scan_folders(self):
+        """Fast parallel scan of all drives for largest folders"""
+        try:
+            self.folder_data = []
+
+            # Get drives quickly
+            self.update_status("Detecting drives...")
+            drives = self.get_drives_fast()
+            self.update_status(f"Found {len(drives)} drives")
+
+            # Get all top-level folders quickly
+            self.update_status("Finding folders...")
+            folders = self.get_top_level_folders(drives)
+            self.update_status(f"Found {len(folders)} folders to scan")
+
+            if not folders:
+                self.root.after(0, self.update_results, [])
+                return
+
+            # Use ThreadPoolExecutor for parallel scanning
             folder_sizes = {}
-            
-            for drive in drives:
-                self.update_status(f"Scanning drive {drive}...")
-                try:
-                    for item in os.listdir(drive):
-                        item_path = os.path.join(drive, item)
-                        if os.path.isdir(item_path):
-                            try:
-                                size = self.get_folder_size(item_path)
-                                if size > 0:
-                                    folder_sizes[item_path] = size
-                                    self.update_status(f"Scanned: {item_path}")
-                            except (OSError, IOError, PermissionError):
-                                continue
-                except (OSError, IOError, PermissionError):
-                    continue
-            
+            completed = 0
+
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all folder scan tasks
+                future_to_folder = {
+                    executor.submit(self.scan_single_folder, folder): folder
+                    for folder in folders
+                }
+
+                # Process completed tasks
+                for future in as_completed(future_to_folder):
+                    try:
+                        folder_path, size = future.result(timeout=60)  # 60 second timeout per folder
+                        if size > 0:
+                            folder_sizes[folder_path] = size
+
+                        completed += 1
+                        progress = (completed / len(folders)) * 100
+                        self.update_status(f"Scanned {completed}/{len(folders)} folders ({progress:.1f}%)")
+
+                    except Exception as e:
+                        completed += 1
+                        continue
+
             # Get top 5 largest folders
-            sorted_folders = sorted(folder_sizes.items(), key=lambda x: x[1], reverse=True)[:5]
-            
-            # Update GUI with results
-            self.root.after(0, self.update_results, sorted_folders)
-            
+            if folder_sizes:
+                sorted_folders = sorted(folder_sizes.items(), key=lambda x: x[1], reverse=True)[:5]
+                self.root.after(0, self.update_results, sorted_folders)
+            else:
+                self.root.after(0, self.update_results, [])
+
         except Exception as e:
             self.root.after(0, self.show_error, f"Error during scan: {str(e)}")
         finally:
